@@ -1,0 +1,90 @@
+#yaml-language-server: $schema=https://json.schemastore.org/github-workflow
+###############################################################################
+# This workflow deploys an an Azure Container Registry using Actions and
+# Azure OIDC. It specifies a minimal set of permissions -- access to the 
+# repo and the ability to write tokens. The Resource Group created will
+# match the repository name, and the region will be hard-coded to East US.
+# In practice, multiple accounts or workflows could be used to enable
+# least-privilege resource creation. A single Azure credential is used which
+# requires subscription Contributor rights for this workflow.
+#
+# Secrets required:
+#
+#  AZURE_CLIENT_ID - The Application ID for the Azure AD application (OIDC)
+#  AZURE_TENANT_ID - The Azure AD directory (tenant) identifier.
+#  AZURE_SUBSCRIPTION_ID - The Azure subscription containing the resources.
+#  REPO_TOKEN - A PAT with repo and org:read permissions.
+###############################################################################
+
+name: deploy-acr
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-infra:
+    name: 'Deploy Azure Environment'
+    runs-on: ubuntu-latest
+    env:
+      AZURE_RG: ${{ github.event.repository.name }}
+      AZURE_RG_LOCATION: 'eastus'
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # Logs in using the application associated with the Client ID
+      # and performs a token exchange to receive the credentials. 
+      # Using OIDC prevents us from needing to include a password or
+      # key in order to authenticate. Instead, it uses a token exchange.
+      - uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # There is a containerized Action available for using the Azure CLI
+      # It is slower than directly using the command line, but can enable
+      # the use of AZ CLI in runners that don't have that app installed.
+      - uses: azure/cli@v1
+        id: azcli
+        with:
+          azcliversion: 2.36.0
+          inlineScript: |
+            #!/bin/bash
+
+            # Create an Azure Resource Group (requires current credential to 
+            # have subscription contribution permissions)
+            az group create --name ${{ env.AZURE_RG}} --location ${{ env.AZURE_RG_LOCATION }}
+
+            # Deploy the Bicep template for the ACR instance and capture the output
+            # to the environment variable DEPLOY_OUTPUT. This requires the credential being
+            # used to have Contributor rights in the Resource Group (or higher)
+            DEPLOY_OUTPUT=$(az deployment group create --resource-group ${{ env.AZURE_RG}} --template-file "infra/acr.bicep")
+
+            # Parse DEPLOY_OUTPUT with jq to retrieve the loginServer name. 
+            # Create an env. variable to store the values.
+            ACR_LOGIN_SERVER=$(jq --raw-output '.properties.outputs.loginServer.value' <<< "$DEPLOY_OUTPUT")
+
+            # Mask the text in the environment variable ACR_LOGIN_SERVER so that
+            # it won't be visible in the logs. Not truly required in this case Since
+            # the server name is not necessarily a value that requires being a secret.
+            echo "::add-mask::$ACR_LOGIN_SERVER"
+
+            # Create an output variable called ACR_LOGIN_SERVER from the environment
+            # variable of the same name. This makes the value available from other steps.
+            echo "::set-output name=ACR_LOGIN_SERVER::$ACR_LOGIN_SERVER"
+      
+      # GH Auth login can use the env variable GH_TOKEN to pass a token
+      # or it can be piped. Because permissions for secrets cannot be configured
+      # for the workflow, we have to use a PAT with the required permissions.
+      - run: echo ${{ secrets.REPO_TOKEN }} | gh auth login --with-token
+
+      # Use the GH CLI to create a secret using a value from a previous step. If
+      # AZ CLI had been used directly, all of these steps could have happened in
+      # a single script. Since azure/cli was used, we need to utilize a step output
+      # to get the value to be assigned and supply it to the --body.
+      - run: gh secret set ACR_LOGIN_SERVER --body ${{ steps.azcli.outputs.ACR_LOGIN_SERVER }}
+
